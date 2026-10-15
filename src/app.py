@@ -5,11 +5,17 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
+
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
@@ -18,6 +24,75 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+TEACHERS_FILE = current_dir / "teachers.json"
+PASSWORD_HASH_ITERATIONS = 600_000
+security = HTTPBasic(auto_error=False)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teachers() -> dict[str, dict[str, str]]:
+    try:
+        with TEACHERS_FILE.open(encoding="utf-8") as teachers_file:
+            data = json.load(teachers_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"Could not load teacher credentials from {TEACHERS_FILE}"
+        ) from error
+
+    if not isinstance(data, dict) or not isinstance(data.get("teachers"), dict):
+        raise RuntimeError(f"Invalid teacher credentials file: {TEACHERS_FILE}")
+
+    teachers = data["teachers"]
+    for username, credentials in teachers.items():
+        if (
+            not isinstance(username, str)
+            or not username
+            or ":" in username
+            or not isinstance(credentials, dict)
+            or not isinstance(credentials.get("salt"), str)
+            or not isinstance(credentials.get("password_hash"), str)
+        ):
+            raise RuntimeError(f"Invalid teacher credentials file: {TEACHERS_FILE}")
+        try:
+            salt = bytes.fromhex(credentials["salt"])
+            password_hash = bytes.fromhex(credentials["password_hash"])
+        except ValueError as error:
+            raise RuntimeError(
+                f"Invalid teacher credentials file: {TEACHERS_FILE}"
+            ) from error
+        if len(salt) < 16 or len(password_hash) != hashlib.sha256().digest_size:
+            raise RuntimeError(f"Invalid teacher credentials file: {TEACHERS_FILE}")
+
+    return teachers
+
+
+def verify_teacher(username: str, password: str) -> bool:
+    teachers = load_teachers()
+    credentials = teachers.get(username)
+    salt = bytes.fromhex(credentials["salt"]) if credentials else b"unknown-user-salt"
+    expected_hash = credentials["password_hash"] if credentials else "0" * 64
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), salt, PASSWORD_HASH_ITERATIONS
+    ).hex()
+    return credentials is not None and hmac.compare_digest(password_hash, expected_hash)
+
+
+def require_teacher(
+    credentials: HTTPBasicCredentials | None = Depends(security),
+) -> str:
+    if credentials is None or not verify_teacher(credentials.username, credentials.password):
+        raise HTTPException(
+            status_code=401,
+            detail="Teacher login required",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
 
 # In-memory activity database
 activities = {
@@ -88,8 +163,19 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(request: LoginRequest):
+    if not verify_teacher(request.username, request.password):
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    return {"username": request.username}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    teacher: str = Depends(require_teacher),
+):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -105,13 +191,20 @@ def signup_for_activity(activity_name: str, email: str):
             detail="Student is already signed up"
         )
 
+    if len(activity["participants"]) >= activity["max_participants"]:
+        raise HTTPException(status_code=400, detail="Activity is full")
+
     # Add student
     activity["participants"].append(email)
     return {"message": f"Signed up {email} for {activity_name}"}
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    teacher: str = Depends(require_teacher),
+):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
